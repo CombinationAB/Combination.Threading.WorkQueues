@@ -41,5 +41,7 @@ namespace Combination.Threading.WorkQueues
                 await processor(item).ConfigureAwait(false);
             }
         }
+
+        public int Count => queue.Count;
     }
 }

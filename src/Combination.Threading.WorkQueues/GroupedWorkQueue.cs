@@ -17,6 +17,7 @@ namespace Combination.Threading.WorkQueues
         private readonly SemaphoreSlim parallelismLock;
         private readonly TimeSpan timeout, cooldown;
         private volatile int parallelCount;
+        private volatile int currentLength;
 
         public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor, int paralellism = 1)
             : this(processor, TimeSpan.FromMilliseconds(100), paralellism)
@@ -33,6 +34,9 @@ namespace Combination.Threading.WorkQueues
             this.timeout = timeout;
             parallelismLock = new SemaphoreSlim(paralellism, paralellism);
         }
+        public int Count => currentLength;
+
+        public int GroupCount => pending.Count;
 
         public void Enqueue(TKey key, TValue value)
         {
@@ -52,6 +56,7 @@ namespace Combination.Threading.WorkQueues
                     entry = new Entry(key, value, timeout, cooldown);
                     pending.Add(key, entry);
                 }
+                Interlocked.Increment(ref currentLength);
             }
             Task.Run(() => ProcessOnce(entry));
         }
@@ -86,6 +91,7 @@ namespace Combination.Threading.WorkQueues
                             {
                                 if (pending.TryGetValue(entry.Key, out var oent) && oent == entry)
                                 {
+                                    Interlocked.Add(ref currentLength, -entry.Count);
                                     pending.Remove(entry.Key);
                                 }
                                 else
@@ -140,6 +146,8 @@ namespace Combination.Threading.WorkQueues
             }
 
             public bool ReadyToFlush => GetTask().IsCompleted;
+
+            public int Count => values.Count;
 
             public Task GetTask()
             {
