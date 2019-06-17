@@ -8,111 +8,150 @@ using System.Threading.Tasks.Dataflow;
 
 namespace Combination.Threading.WorkQueues
 {
+    /// <summary>
+    /// Options used with the GroupWorkQueue.
+    /// </summary>
+    public sealed class GroupedWorkQueueOptions
+    {
+        /// <summary>
+        /// Number of groups that can be processed in parallel.
+        /// </summary>
+        public int Parallelism { get; set; } = 1;
+        /// <summary>
+        /// For how long no new updates are to be sent to a group for considering processing it. Set to zero or negative for no cooldown (a group is always eligible).
+        /// </summary>
+        public TimeSpan Cooldown { get; set; } = TimeSpan.FromMilliseconds(100);
+
+        /// <summary>
+        /// Cooldown timeout. If this timeout passes, a group is processed even if cooldown keeps happening. Set to zero or negative for no timeout.
+        /// </summary>
+        public TimeSpan Timeout { get; set; } = TimeSpan.Zero;
+    }
+
     public sealed class GroupedWorkQueue<TKey, TValue>
     {
         private readonly Dictionary<TKey, Entry> pending = new Dictionary<TKey, Entry>();
         private readonly Func<TKey, IEnumerable<TValue>, Task> processor;
         private volatile bool stopped;
-        private readonly TaskCompletionSource<object> runTask = new TaskCompletionSource<object>();
-        private readonly SemaphoreSlim parallelismLock;
-        private readonly TimeSpan timeout, cooldown;
-        private volatile int parallelCount;
+        private readonly Stopwatch timer = Stopwatch.StartNew();
+        private readonly Task runLoopTask;
+        private readonly BufferBlock<Entry> queue = new BufferBlock<Entry>();
+        private readonly TimeSpan timeout, cooldown, idleDelay;
         private volatile int currentLength;
+        private readonly CancellationTokenSource cancel = new CancellationTokenSource();
 
-        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor, int paralellism = 1)
-            : this(processor, TimeSpan.FromMilliseconds(100), paralellism)
+        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor)
+            : this(processor, new GroupedWorkQueueOptions())
         {
         }
-        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor, TimeSpan cooldown, int paralellism = 1)
-            : this(processor, cooldown, TimeSpan.Zero, paralellism)
+
+        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor, int parallelism)
+            : this(processor, new GroupedWorkQueueOptions { Parallelism = parallelism })
         {
         }
-        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor, TimeSpan cooldown, TimeSpan timeout, int paralellism = 1)
+        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor, GroupedWorkQueueOptions options)
         {
+            if (options == null) options = new GroupedWorkQueueOptions();
             this.processor = processor;
-            this.cooldown = cooldown;
-            this.timeout = timeout;
-            parallelismLock = new SemaphoreSlim(paralellism, paralellism);
-        }
-        public int Count => currentLength;
-
-        public int GroupCount => pending.Count;
-
-        public void Enqueue(TKey key, TValue value)
-        {
-            if (stopped)
-                return;
-            Entry entry;
-            lock (pending)
+            cooldown = options.Cooldown;
+            if (cooldown.TotalMilliseconds >= 100)
             {
-                if (stopped)
-                    return;
-                if (pending.TryGetValue(key, out entry))
+                idleDelay = TimeSpan.FromMilliseconds(10);
+            }
+            else
+            {
+                idleDelay = TimeSpan.FromMilliseconds(1);
+            }
+            timeout = options.Timeout;
+            runLoopTask = Task.WhenAll(Enumerable.Range(0, options.Parallelism).Select(_ => Task.Run(ProcessLoop)));
+        }
+
+        private async Task ProcessLoop()
+        {
+            while (!stopped || queue.Count > 0)
+            {
+                try
                 {
-                    entry.Add(value);
+                    await queue.OutputAvailableAsync(cancel.Token).ConfigureAwait(false);
+                }
+                catch (TaskCanceledException)
+                {
+                }
+                if (stopped && queue.Count == 0) break;
+                var now = timer.Elapsed;
+                Entry entry;
+                var didFindEntry = false;
+                lock (pending)
+                {
+                    if (queue.TryReceive(x => x.ReadyTime <= now, out entry))
+                    {
+                        pending.Remove(entry.Key);
+                        didFindEntry = true;
+                    }
+                }
+                if (didFindEntry)
+                {
+                    await processor(entry.Key, entry.Values).ConfigureAwait(false);
                 }
                 else
                 {
-                    entry = new Entry(key, value, timeout, cooldown);
+                    if (stopped && queue.Count == 0) break;
+                    await Task.Delay(idleDelay);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Number of values currently in the queue.
+        /// </summary>
+        public int Count => currentLength;
+
+        /// <summary>
+        /// Number of groups currently in the queue.
+        /// </summary>
+        public int GroupCount => pending.Count;
+
+        /// <summary>
+        /// Enqueues a new value.
+        /// </summary>
+        /// <param name="key">The group key</param>
+        /// <param name="value">The value</param>
+        /// <returns>True if the group key was added, false if it already existed in the queue</returns>
+        public bool Enqueue(TKey key, TValue value)
+        {
+            if (stopped)
+                return false;
+            var didAdd = false;
+            var now = timer.Elapsed;
+            lock (pending)
+            {
+                if (stopped)
+                    return false;
+                if (pending.TryGetValue(key, out var entry))
+                {
+                    entry.Add(value, now + cooldown);
+                }
+                else
+                {
+                    entry = new Entry(key, value, timeout > TimeSpan.Zero ? now + timeout : TimeSpan.MaxValue, now + cooldown);
                     pending.Add(key, entry);
+                    didAdd = true;
+                    queue.Post(entry);
                 }
                 Interlocked.Increment(ref currentLength);
             }
-            Task.Run(() => ProcessOnce(entry));
+            return didAdd;
         }
 
+        /// <summary>
+        /// Stops processing new works.
+        /// </summary>
+        /// <returns>A task that is completed when all queued work is done.</returns>
         public Task Stop()
         {
-            lock (pending)
-            {
-                stopped = true;
-                if (parallelCount == 0 && pending.Count == 0) return Task.CompletedTask;
-            }
-            return runTask.Task;
-        }
-
-        private async Task ProcessOnce(Entry entry)
-        {
-            Interlocked.Increment(ref parallelCount);
-            try
-            {
-                for (; ; )
-                {
-                    await entry.GetTask();
-
-                    if (!entry.ReadyToFlush)
-                        return;
-
-                    if (await parallelismLock.WaitAsync(1))
-                    {
-                        try
-                        {
-                            lock (pending)
-                            {
-                                if (pending.TryGetValue(entry.Key, out var oent) && oent == entry)
-                                {
-                                    Interlocked.Add(ref currentLength, -entry.Count);
-                                    pending.Remove(entry.Key);
-                                }
-                                else
-                                {
-                                    return;
-                                }
-                            }
-                            await processor(entry.Key, entry.Values).ConfigureAwait(false);
-                            return;
-                        }
-                        finally
-                        {
-                            parallelismLock.Release();
-                        }
-                    }
-                }
-            }
-            finally
-            {
-                if (Interlocked.Decrement(ref parallelCount) == 0 && stopped && pending.Count == 0) runTask.SetResult(null);
-            }
+            stopped = true;
+            cancel.Cancel();
+            return runLoopTask;
         }
 
         private class Entry
@@ -120,81 +159,29 @@ namespace Combination.Threading.WorkQueues
             public TKey Key { get; }
             private readonly List<TValue> values = new List<TValue>();
             public IEnumerable<TValue> Values => values;
-            private Task waitTask;
             private readonly TimeSpan timeout;
-            private readonly Stopwatch timeoutTimer;
-            private readonly TimeSpan cooldown;
-            private Stopwatch cooldownTimer;
+            private TimeSpan cooldown;
 
             public Entry(TKey key, TValue value, TimeSpan timeout, TimeSpan cooldown)
             {
                 Key = key;
                 this.timeout = timeout;
                 this.cooldown = cooldown;
-                if (timeout > TimeSpan.Zero && cooldown > TimeSpan.Zero) timeoutTimer = Stopwatch.StartNew();
-                Add(value);
+                Add(value, cooldown);
             }
 
-            public void Add(TValue value)
+            public void Add(TValue value, TimeSpan newCooldown)
             {
-                waitTask = null;
                 lock (values)
                 {
-                    if (cooldown > TimeSpan.Zero) cooldownTimer = Stopwatch.StartNew();
+                    cooldown = newCooldown;
                     values.Add(value);
                 }
             }
 
-            public bool ReadyToFlush => GetTask().IsCompleted;
+            public TimeSpan ReadyTime => cooldown > timeout ? timeout : cooldown;
 
             public int Count => values.Count;
-
-            public Task GetTask()
-            {
-                if (waitTask != null) return waitTask;
-                lock (values)
-                {
-                    if (waitTask != null) return waitTask;
-                    Task cooldownDelay = null;
-                    if (cooldownTimer != null)
-                    {
-                        var delay = cooldown - cooldownTimer.Elapsed;
-                        if (delay > TimeSpan.Zero)
-                        {
-                            cooldownDelay = Task.Delay(delay);
-                        }
-                    }
-                    Task timeoutDelay = null;
-                    if (timeoutTimer != null)
-                    {
-                        var delay = timeout - timeoutTimer.Elapsed;
-                        if (delay > TimeSpan.Zero)
-                        {
-                            timeoutDelay = Task.Delay(delay);
-                        }
-                    }
-                    if (cooldownDelay != null)
-                    {
-                        if (timeoutDelay != null)
-                        {
-                            waitTask = Task.WhenAny(cooldownDelay, timeoutDelay);
-                        }
-                        else
-                        {
-                            waitTask = cooldownDelay;
-                        }
-                    }
-                    else if (timeoutDelay != null)
-                    {
-                        waitTask = timeoutDelay;
-                    }
-                    else
-                    {
-                        waitTask = Task.CompletedTask;
-                    }
-                    return waitTask;
-                }
-            }
         }
     }
 }

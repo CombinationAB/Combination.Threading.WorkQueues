@@ -66,7 +66,7 @@ namespace Combination.Threading.WorkQueues.Tests
                 lock (lockRoot) maxParallel = Math.Max(currentParallel, maxParallel);
                 Interlocked.Decrement(ref currentParallel);
             }
-            var q = new GroupedWorkQueue<int, string>(TestProcessor, TimeSpan.FromMilliseconds(100), 2);
+            var q = new GroupedWorkQueue<int, string>(TestProcessor, 2);
             q.Enqueue(0, "Hello1");
             await Task.Delay(1);
             q.Enqueue(1, "Hello2");
@@ -90,7 +90,11 @@ namespace Combination.Threading.WorkQueues.Tests
                 lock (lockRoot) maxParallel = Math.Max(currentParallel, maxParallel);
                 Interlocked.Decrement(ref currentParallel);
             }
-            var q = new GroupedWorkQueue<int, string>(TestProcessor, TimeSpan.Zero, 2);
+            var q = new GroupedWorkQueue<int, string>(TestProcessor, new GroupedWorkQueueOptions
+            {
+                Cooldown = TimeSpan.Zero,
+                Parallelism = 2
+            });
             q.Enqueue(0, "Hello1");
             await Task.Delay(1);
             q.Enqueue(1, "Hello2");
@@ -120,7 +124,12 @@ namespace Combination.Threading.WorkQueues.Tests
                 }
                 Interlocked.Decrement(ref currentParallel);
             }
-            var q = new GroupedWorkQueue<int, Stopwatch>(TestProcessor, TimeSpan.FromMilliseconds(1000), TimeSpan.FromMilliseconds(500), 2);
+            var q = new GroupedWorkQueue<int, Stopwatch>(TestProcessor, new GroupedWorkQueueOptions
+            {
+                Cooldown = TimeSpan.FromMilliseconds(1000),
+                Timeout = TimeSpan.FromMilliseconds(500),
+                Parallelism = 2
+            });
             for (var i = 0; i < 10; ++i)
             {
                 q.Enqueue(0, Stopwatch.StartNew());
