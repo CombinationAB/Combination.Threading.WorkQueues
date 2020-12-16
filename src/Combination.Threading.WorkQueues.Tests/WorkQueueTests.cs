@@ -51,5 +51,22 @@ namespace Combination.Threading.WorkQueues.Tests
             Assert.Equal(0, currentParallel);
             Assert.InRange(maxParallel, numParallel == 1 ? 1 : 2, numParallel);
         }
+
+        [Fact]
+        public async Task Count_Updated()
+        {
+            var l = new List<string>();
+            async Task Mupp(string k)
+            {
+                await Task.Delay(100);
+                l.Add(k);
+            }
+            var q = new WorkQueue<string>(Mupp);
+            Assert.Equal(0, q.Count);
+            q.Enqueue("Hello");
+            Assert.Equal(1, q.Count);
+            await q.Stop();
+            Assert.Equal(0, q.Count);
+        }
     }
 }

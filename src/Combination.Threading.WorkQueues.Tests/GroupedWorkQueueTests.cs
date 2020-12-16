@@ -195,5 +195,28 @@ namespace Combination.Threading.WorkQueues.Tests
             Assert.InRange(numTotal, numKeys, numItems);
             Assert.Equal(numKeys, counts.Count);
         }
+
+        [Fact]
+        public async Task Count_Updated()
+        {
+            var l = new List<string[]>();
+            async Task TestProcessor(int key, IEnumerable<string> k)
+            {
+                await Task.Delay(100);
+                l.Add(k.ToArray());
+            }
+            var q = new GroupedWorkQueue<int, string>(TestProcessor);
+            Assert.Equal(0, q.Count);
+            Assert.Equal(0, q.GroupCount);
+            q.Enqueue(0, "Hello");
+            Assert.Equal(1, q.Count);
+            Assert.Equal(1, q.GroupCount);
+            q.Enqueue(0, "Hello");
+            Assert.Equal(2, q.Count);
+            Assert.Equal(1, q.GroupCount);
+            await q.Stop();
+            Assert.Equal(0, q.Count);
+            Assert.Equal(0, q.GroupCount);
+        }
     }
 }

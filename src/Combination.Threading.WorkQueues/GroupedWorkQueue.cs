@@ -87,6 +87,7 @@ namespace Combination.Threading.WorkQueues
                     {
                         pending.Remove(entry.Key);
                         didFindEntry = true;
+                        Interlocked.Add(ref currentLength, -entry.Count);
                     }
                 }
                 if (didFindEntry)
