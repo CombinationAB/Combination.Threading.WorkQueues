@@ -15,10 +15,10 @@ namespace Combination.Threading.WorkQueues
         private volatile bool stopped;
         private readonly Task runLoopTask;
 
-        public WorkQueue(Func<T, Task> processor, int paralellism = 1)
+        public WorkQueue(Func<T, Task> processor, int parallelism = 1)
         {
             this.processor = processor;
-            runLoopTask = Task.WhenAll(Enumerable.Range(0, paralellism).Select(_ => Task.Run(ProcessLoop)));
+            runLoopTask = Task.WhenAll(Enumerable.Range(0, parallelism).Select(_ => Task.Run(ProcessLoop)));
         }
 
         public void Enqueue(T item)
