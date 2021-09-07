@@ -17,6 +17,7 @@ namespace Combination.Threading.WorkQueues
         /// Number of groups that can be processed in parallel.
         /// </summary>
         public int Parallelism { get; set; } = 1;
+
         /// <summary>
         /// For how long no new updates are to be sent to a group for considering processing it. Set to zero or negative for no cooldown (a group is always eligible).
         /// </summary>
@@ -28,40 +29,117 @@ namespace Combination.Threading.WorkQueues
         public TimeSpan Timeout { get; set; } = TimeSpan.Zero;
     }
 
-    public sealed class GroupedWorkQueue<TKey, TValue>
+    public static class GroupedWorkQueue
+    {
+        public static GroupedWorkQueue<TKey, TValue, TAgg> Create<TKey, TValue, TAgg>(
+            GroupedWorkQueue<TKey, TValue, TAgg>.ProcessorCallback processor,
+            Func<TAgg, TValue, TAgg> aggregation,
+            Func<TAgg> initial,
+            GroupedWorkQueueOptions options = null)
+            => new GroupedWorkQueue<TKey, TValue, TAgg>(processor, aggregation, initial,
+                options ?? new GroupedWorkQueueOptions());
+
+        public static GroupedWorkQueue<TKey, TValue, (bool, TValue)> First<TKey, TValue>(
+            GroupedWorkQueue<TKey, TValue, TValue>.ProcessorCallback processor,
+            GroupedWorkQueueOptions options = null)
+            => new GroupedWorkQueue<TKey, TValue, (bool, TValue)>(
+                (k, v) => processor(k, v.Item2), 
+                (prev, val) => prev.Item1 ? prev : (true, val), 
+                () => (false, default),
+                options ?? new GroupedWorkQueueOptions());
+
+        public static GroupedWorkQueue<TKey, TValue, TValue> Last<TKey, TValue>(
+            GroupedWorkQueue<TKey, TValue, TValue>.ProcessorCallback processor,
+            GroupedWorkQueueOptions options = null)
+            => new GroupedWorkQueue<TKey, TValue, TValue>(processor, (_, val) => val, () => default,
+                options ?? new GroupedWorkQueueOptions());
+
+        public static GroupedWorkQueue<TKey, TValue> All<TKey, TValue>(
+            GroupedWorkQueue<TKey, TValue>.ProcessorCallback processor,
+            GroupedWorkQueueOptions options = null)
+            => new GroupedWorkQueue<TKey, TValue>(processor, options ?? new GroupedWorkQueueOptions());
+    }
+
+    public sealed class GroupedWorkQueue<TKey, TValue> : GroupedWorkQueue<TKey, TValue, IEnumerable<TValue>>
+    {
+        private volatile int currentLength;
+
+        public GroupedWorkQueue(ProcessorCallback processor)
+            : base(processor, EnumAdd, NewList)
+        {
+        }
+
+        public GroupedWorkQueue(ProcessorCallback processor, int parallelism)
+            : base(processor, EnumAdd, NewList, parallelism)
+        {
+        }
+
+        public GroupedWorkQueue(ProcessorCallback processor, GroupedWorkQueueOptions options)
+            : base(processor, EnumAdd, NewList, options)
+        {
+        }
+
+        private static IEnumerable<TValue> EnumAdd(IEnumerable<TValue> previous, TValue value)
+        {
+            ((List<TValue>) previous).Add(value);
+            return previous;
+        }
+
+        private static IEnumerable<TValue> NewList()
+            => new List<TValue>();
+
+        /// <summary>
+        /// Number of values currently in the queue.
+        /// </summary>
+        public int Count => currentLength;
+
+        protected override void OnRemoved(Entry entry)
+        {
+            Interlocked.Add(ref currentLength, -((List<TValue>) entry.Aggregate).Count);
+        }
+
+        protected override void OnAdded(Entry entry)
+        {
+            Interlocked.Increment(ref currentLength);
+        }
+    }
+
+    public class GroupedWorkQueue<TKey, TValue, TAgg>
     {
         private readonly Dictionary<TKey, Entry> pending = new Dictionary<TKey, Entry>();
-        private readonly Func<TKey, IEnumerable<TValue>, Task> processor;
+        private readonly ProcessorCallback processor;
+        private readonly Func<TAgg, TValue, TAgg> aggregation;
+        private readonly Func<TAgg> initial;
         private volatile bool stopped;
         private readonly Stopwatch timer = Stopwatch.StartNew();
         private readonly Task runLoopTask;
         private readonly BufferBlock<Entry> queue = new BufferBlock<Entry>();
         private readonly TimeSpan timeout, cooldown, idleDelay;
-        private volatile int currentLength;
         private readonly CancellationTokenSource cancel = new CancellationTokenSource();
 
-        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor)
-            : this(processor, new GroupedWorkQueueOptions())
+        public delegate Task ProcessorCallback(TKey key, TAgg aggregation);
+
+        public GroupedWorkQueue(ProcessorCallback processor, Func<TAgg, TValue, TAgg> aggregation, Func<TAgg> initial)
+            : this(processor, aggregation, initial, new GroupedWorkQueueOptions())
         {
         }
 
-        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor, int parallelism)
-            : this(processor, new GroupedWorkQueueOptions { Parallelism = parallelism })
+        public GroupedWorkQueue(ProcessorCallback processor, Func<TAgg, TValue, TAgg> aggregation, Func<TAgg> initial,
+            int parallelism)
+            : this(processor, aggregation, initial, new GroupedWorkQueueOptions {Parallelism = parallelism})
         {
         }
-        public GroupedWorkQueue(Func<TKey, IEnumerable<TValue>, Task> processor, GroupedWorkQueueOptions options)
+
+        public GroupedWorkQueue(ProcessorCallback processor, Func<TAgg, TValue, TAgg> aggregation, Func<TAgg> initial,
+            GroupedWorkQueueOptions options)
         {
             if (options == null) options = new GroupedWorkQueueOptions();
             this.processor = processor;
+            this.aggregation = aggregation;
+            this.initial = initial;
             cooldown = options.Cooldown;
-            if (cooldown.TotalMilliseconds >= 100)
-            {
-                idleDelay = TimeSpan.FromMilliseconds(10);
-            }
-            else
-            {
-                idleDelay = TimeSpan.FromMilliseconds(1);
-            }
+            idleDelay = TimeSpan.FromMilliseconds(cooldown.TotalMilliseconds >= 100 ? 10 : 1);
+
             timeout = options.Timeout;
             runLoopTask = Task.WhenAll(Enumerable.Range(0, options.Parallelism).Select(_ => Task.Run(ProcessLoop)));
         }
@@ -77,6 +155,7 @@ namespace Combination.Threading.WorkQueues
                 catch (TaskCanceledException)
                 {
                 }
+
                 if (stopped && queue.Count == 0) break;
                 var now = timer.Elapsed;
                 Entry entry;
@@ -87,12 +166,13 @@ namespace Combination.Threading.WorkQueues
                     {
                         pending.Remove(entry.Key);
                         didFindEntry = true;
-                        Interlocked.Add(ref currentLength, -entry.Count);
                     }
                 }
+
                 if (didFindEntry)
                 {
-                    await processor(entry.Key, entry.Values).ConfigureAwait(false);
+                    OnRemoved(entry);
+                    await processor(entry.Key, entry.Aggregate).ConfigureAwait(false);
                 }
                 else
                 {
@@ -102,10 +182,13 @@ namespace Combination.Threading.WorkQueues
             }
         }
 
-        /// <summary>
-        /// Number of values currently in the queue.
-        /// </summary>
-        public int Count => currentLength;
+        protected virtual void OnRemoved(Entry entry)
+        {
+        }
+
+        protected virtual void OnAdded(Entry entry)
+        {
+        }
 
         /// <summary>
         /// Number of groups currently in the queue.
@@ -134,13 +217,20 @@ namespace Combination.Threading.WorkQueues
                 }
                 else
                 {
-                    entry = new Entry(key, value, timeout > TimeSpan.Zero ? now + timeout : TimeSpan.MaxValue, now + cooldown);
+                    entry = new Entry(
+                        key,
+                        value,
+                        timeout > TimeSpan.Zero ? now + timeout : TimeSpan.MaxValue, now + cooldown,
+                        aggregation,
+                        initial());
                     pending.Add(key, entry);
                     didAdd = true;
                     queue.Post(entry);
                 }
-                Interlocked.Increment(ref currentLength);
+
+                OnAdded(entry);
             }
+
             return didAdd;
         }
 
@@ -152,37 +242,40 @@ namespace Combination.Threading.WorkQueues
         {
             stopped = true;
             cancel.Cancel();
-            return runLoopTask;
+            return runLoopTask.ContinueWith(task => { Stopped?.Invoke(); });
         }
 
-        private class Entry
+        public event Action Stopped;
+
+        protected class Entry
         {
             public TKey Key { get; }
-            private readonly List<TValue> values = new List<TValue>();
-            public IEnumerable<TValue> Values => values;
+            public TAgg Aggregate { get; private set; }
             private readonly TimeSpan timeout;
             private TimeSpan cooldown;
+            private readonly Func<TAgg, TValue, TAgg> aggregation;
 
-            public Entry(TKey key, TValue value, TimeSpan timeout, TimeSpan cooldown)
+            public Entry(TKey key, TValue value, TimeSpan timeout, TimeSpan cooldown,
+                Func<TAgg, TValue, TAgg> aggregation, TAgg initial)
             {
                 Key = key;
+                Aggregate = initial;
                 this.timeout = timeout;
                 this.cooldown = cooldown;
+                this.aggregation = aggregation;
                 Add(value, cooldown);
             }
 
             public void Add(TValue value, TimeSpan newCooldown)
             {
-                lock (values)
+                lock (this)
                 {
                     cooldown = newCooldown;
-                    values.Add(value);
+                    Aggregate = aggregation(Aggregate, value);
                 }
             }
 
             public TimeSpan ReadyTime => cooldown > timeout ? timeout : cooldown;
-
-            public int Count => values.Count;
         }
     }
 }
