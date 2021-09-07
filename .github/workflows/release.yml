@@ -5,7 +5,7 @@ on:
     types: [published]
 
 env:
-  projectName: Combination.Collections
+  projectName: Combination.Threading.WorkQueues
   nugetSource: https://api.nuget.org/v3/index.json
 
 jobs:
