@@ -1,0 +1,29 @@
+name: .NET Release
+
+on:
+  release:
+    types: [published]
+
+env:
+  projectName: Combination.Collections
+  nugetSource: https://api.nuget.org/v3/index.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: 5.0.x
+      - name: Restore dependencies
+        run: dotnet restore
+      - name: Build
+        run: dotnet build --no-restore --configuration Release /p:Version=$(echo $GITHUB_REF | cut -d / -f 3)
+      - name: Test
+        run: dotnet test --no-build --no-restore --configuration Release --no-restore /p:Version=$(echo $GITHUB_REF | cut -d / -f 3)
+      - name: Publish
+        run: find . -name $projectName\*.nupkg -print -exec dotnet nuget push -s $nugetSource -k ${{ secrets.NUGET_ORG_KEY }} {} \;
+
