@@ -6,7 +6,6 @@ on:
 
 env:
   projectName: Combination.Threading.WorkQueues
-  nugetSource: https://api.nuget.org/v3/index.json
 
 jobs:
   build:
@@ -24,6 +23,7 @@ jobs:
         run: dotnet build --no-restore --configuration Release /p:Version=$(echo $GITHUB_REF | cut -d / -f 3)
       - name: Test
         run: dotnet test --no-build --no-restore --configuration Release --no-restore /p:Version=$(echo $GITHUB_REF | cut -d / -f 3)
-      - name: Publish
-        run: find . -name $projectName\*.nupkg -print -exec dotnet nuget push -s $nugetSource -k ${{ secrets.NUGET_ORG_KEY }} {} \;
-
+      - name: Publish to nuget.org
+        run: find . -name $projectName\*.nupkg -print -exec dotnet nuget push -s https://api.nuget.org/v3/index.json -k ${{ secrets.NUGET_ORG_KEY }} {} \;
+      - name: Publish to GitHub
+        run: find . -name $projectName\*.nupkg -print -exec dotnet nuget push -s github -k ${{ secrets.GITHUB_TOKEN }} {} \;
